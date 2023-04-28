@@ -1,0 +1,563 @@
+---
+---
+title: "Prediction of Housing Pricing"
+author: "Sonya Khudyakov"
+date: "4/22/2022"
+output: html_document
+---
+
+# Prediction of Housing Pricing in the Greater Boston Area
+
+
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+#All packages that will be used in the code:
+library(tensorflow)
+library(dplyr)
+library(GGally)
+library(randomForest)
+library(e1071)
+library(pROC)
+#library(tidyverse)
+library(ggplot2)   # plotting
+library(caret)     # automating the tuning process
+library(vip)       # variable importance
+library(pdp)       # variable relationships
+
+```
+
+## Data Sources and Description
+
+Data for that project were ...
+
+```{r read_data,echo=FALSE}
+#reading csv data
+houses = read.csv("~/Desktop/School work/Spring 23/Data Analytics/Project/Project Data/soldHouses.csv")
+fbi = read.csv("~/Desktop/School work/Spring 23/Data Analytics/Project/Project Data/fbiData_MA.csv")
+mortgage = read.csv("~/Desktop/School work/Spring 23/Data Analytics/Project/Project Data/mortgage.csv")
+cityConversion = read.csv("~/Desktop/School work/Spring 23/Data Analytics/Project/Project Data/CityConversion.csv")
+```
+
+## Data Pre-processing
+
+I noticed that not all houses were sold.
+Namely, "Sold" status was missing in the following number (%) of the records:
+
+```{r sold_m, echo=FALSE}
+
+#Below was used to find the % of how many data points are blank for sold date in the houses data
+total_blank <- sum(is.na(houses$SOLD.DATE) | is.null(houses$SOLD.DATE) | houses$SOLD.DATE == "")
+c(round(total_blank,0),round(100*total_blank/dim(houses)[1],0)) #12.178% are blank
+```
+
+Since the the main goal of In this project is a house price prediction, I excluded all records with missing "Sold" status from the data. For a fair comparison I considered only condo, townhouses and single residential.
+
+```{r sold_f,echo=FALSE}
+#Below filtering for when Status is Sold
+sold <-houses %>% 
+  filter(STATUS=="Sold", PROPERTY.TYPE%in%c("Condo/Co-op", "Townhouse","Single Family Residential"))
+sold <- sold[!duplicated(sold),]
+#dim(sold)
+#sum(!is.na(sold$SOLD.DATE))
+```
+
+The distribution of the cities and sold houses inthe new dataset was the following:
+```{r distr_city,echo=FALSE}
+#table(sold$LOCATION)
+#table(houses$CITY)
+#unique(houses$CITY)
+table(sold$CITY)
+```
+
+Some of the cities have a very small number of observations and that may cause a problem when we will randomly split the data for a training and a testing data sets, one of them may not include such cities and the whole model would not be able to include "CITY" as a factor. There are two possible solutions: y
+
+- to exclude cities with 10 or less observations; 
+
+- to combine certain cities based on similarity of characteristics.
+
+For the purposes of the project I decided to exclude the cities with 10 less records. 
+```{r select_city,echo=FALSE}
+sold<- sold %>%
+  filter(!CITY%in%c("Grafton","Malden","Needham","Other","Plymouth","Quincy","Waltham","Wellesley","Winchester"))
+```
+
+I created a new column for the date sold and reformatting the date column in the houses data frame to match mortgage.
+```{r date,echo=TRUE}
+sold$newSoldDate <- strptime(as.character(sold$SOLD.DATE), "%m/%d/%Y")
+#sold$newSoldDate<-format(sold$newSoldDate, "%Y-%m-%d")
+```
+
+I converted the city names in the sold houses data to match FBI city names
+
+```{r conv_city,echo=TRUE}
+#Code to convert the city names in the sold houses data to match FBI city names
+sold$CITY <- cityConversion$Convert.City.Name[match(sold$CITY ,cityConversion$Houses.City.Name)] #converting boroughs to city/town names
+sold$CITY[is.na(sold$CITY)] <- "Boston" #if city is blank then put in Boston for that
+cityConversion$Convert.City.Name[is.na(cityConversion$Convert.City.Name)] <- "Boston" #if city is blank then put in Boston for that
+```
+
+Converted charcaters to numeric, added new variable Crime Rate
+```{r conv_date,echo=FALSE}
+#Converting character columns to numeric in FBI data
+fbi$population<-as.numeric(gsub(",","",fbi$Population)) 
+fbi$Violent.crime<-as.numeric(gsub(",","",fbi$Violent.crime)) 
+fbi$Aggravated.assault<-as.numeric(gsub(",","",fbi$Aggravated.assault)) 
+fbi$Robbery<-as.numeric(gsub(",","",fbi$Robbery)) 
+fbi$Property.crime<-as.numeric(gsub(",","",fbi$Property.crime)) 
+fbi$Burglary<-as.numeric(gsub(",","",fbi$Burglary)) 
+fbi$Larceny..theft<-as.numeric(gsub(",","",fbi$Larceny..theft)) 
+fbi$Motor.vehicle.theft<-as.numeric(gsub(",","",fbi$Motor.vehicle.theft)) 
+fbi$Arson2<-as.numeric(gsub(",","",fbi$Arson2)) 
+
+fbi$CrimeRate <- ((fbi$Violent.crime+fbi$Murder.and.nonnegligent.manslaughter+fbi$Rape1+fbi$Robbery+fbi$Aggravated.assault+fbi$Burglary+
+                    fbi$Larceny..theft)/fbi$population)*100
+hist(fbi$CrimeRate)
+
+```
+
+Manual Changes needed to be done when noticed weird data
+```{r manual_changes,echo=FALSE}
+
+#changing bath # for a listing because when corr matrix was done, noticed a listing with too much, checked and found the real number
+sold[sold$URL..SEE.https...www.redfin.com.buy.a.home.comparative.market.analysis.FOR.INFO.ON.PRICING.=="https://www.redfin.com/MA/Brookline/173-Mason-Ter-02446/home/11452729",c("BEDS","BATHS","SQUARE.FEET")]<-c(4,3.5,2138)
+#sold[sold$URL..SEE.https...www.redfin.com.buy.a.home.comparative.market.analysis.FOR.INFO.ON.PRICING.=="https://www.redfin.com/MA/Brookline/173-Mason-Ter-02446/home/11452729",]
+
+sold[sold$ADDRESS=="13 Cottage Ave #1",c("BATHS")]<-c(3.5)
+#sold[sold$ADDRESS=="13 Cottage Ave #1",]
+
+sold[sold$ADDRESS=="115 W 7th St #3",c("BEDS","BATHS")]<-c(1,1)
+#sold[sold$ADDRESS=="115 W 7th St #3",]
+
+#cc was used to figure out if any values found were needed to be double checled
+#cc<-sold[sold$BATHS>20,]
+#cc<-sold[sold$SQUARE.FEET>50000,]
+#cc<-sold[sold$BEDS>8,]
+
+
+```
+
+
+
+Merging Data
+```{r merge,echo=FALSE}
+
+joined_df <- merge(sold, fbi, by.x = "CITY", 
+                   by.y = "City", all.x = TRUE, all.y = FALSE)
+
+#merging mortgage data with the combined previous data 
+colnames(mortgage) <- c("newSoldDate","mortgage_rate") #renaming mortgage columns to match main data
+mortgage$mortgage_rate0 <- as.numeric(mortgage$mortgage_rate) # changing data type to numeric instead of charaters
+for (i in 1:dim(mortgage)[1]){
+  a <- mortgage[i,"mortgage_rate0"]
+  if (is.na(a)){
+    a <- mortgage[i-1,"mortgage_rate0"]
+    
+  }
+  mortgage[i,"mortgage_rate"] <- a
+}
+
+mortgage$mortgage_rate<-as.numeric(gsub(",","",mortgage$mortgage_rate)) 
+Mortgage <- mortgage %>% 
+              filter(!is.na(mortgage_rate))
+#mortgage[mortgage$mortgage_rate]
+Mortgage$mortgage_rate<-as.numeric(gsub(",","",Mortgage$mortgage_rate)) 
+summary(Mortgage$mortgage_rate)
+Mortgage$mrate <- ifelse(Mortgage$mortgage_rate<3.5,0,ifelse(Mortgage$mortgage_rate<5.5,1,2)) # adding new column mrate
+Mortgage$newSoldDate<-as.POSIXct(Mortgage$newSoldDate) #converting column from character to date type
+mdata <- joined_df %>% left_join(Mortgage,by="newSoldDate") # left joining data
+
+#Final data frame that contains the columns that will be used for the models
+df<- mdata[,c("newSoldDate","PRICE","CITY","BEDS","BATHS","SQUARE.FEET","YEAR.BUILT","population","Violent.crime",
+                   "Murder.and.nonnegligent.manslaughter","Rape1","Robbery","Aggravated.assault","CrimeRate","mortgage_rate","mrate")]
+
+#renaming column names
+colnames(df) <- c("SoldDate","price","city","beds","baths","sq_feet","year_built","population","violent_crime",
+                  "manslaughter","rape","robbery","agg_assault","CrimeRate","mortgage_rate","mrate")
+df$mortgage_rate <- ifelse(is.na(df$mortgage_rate),6.743,df$mortgage_rate)
+df$mrate <- ifelse(is.na(df$mrate),2,df$mrate)
+```
+
+
+EDA
+``` {r EDA, echo=FALSE}
+hist(df$price)
+labels = c("Baths","Beds")
+boxplot(df$beds,df$baths, main="Boxplots of Beds and Bathrooms quantities",names=labels)
+
+```
+```{r squareFeet,echo=FALSE}
+df$sq_feet2 <- df$sq_feet^2
+df$sq_feetlog <- log(df$sq_feet)
+```
+
+
+Corelation and relationship matrix/visuals
+```{r crime,echo=FALSE}
+ggplot(df,aes(x=city,y=CrimeRate))+labs(title = "CrimeRate in City")+
+    geom_point(stat='identity')
+
+```
+```{r corr_matrix,message=FALSE,warning=FALSE}
+
+#corr graphs and coefficients: "price"~"beds","baths","sq_feet"
+ggpairs(df[,c("price","beds","baths","sq_feet")])
+
+df$log_price <- log(df$price) # adding a new column of price that is the log of price original value
+
+#corr graphs and coefficients: "price"|"log_price"~"beds","baths","sq_feet"
+ggpairs(df[,c("price","log_price","beds","baths","sq_feet")])
+
+#corr graphs and coefficients: "price"~"year_built","population","violent_crime"
+ggpairs(df[,c("price","year_built","population","CrimeRate","mortgage_rate")])
+
+```
+
+
+Train-Test Splitting Data
+```{r train_test,echo=FALSE,message=FALSE}
+########################################################################################################
+# Set seed for reproducibility
+set.seed(123)
+
+# Split data into training and testing sets
+trainIndex <- sample(seq_len(nrow(df)),size=.7*nrow(df)) 
+trainData <- df[trainIndex, ]
+testData <- df[-trainIndex, ]
+
+#creating a new df that has standardizes the independent variables
+df_std <- df %>% mutate_at(c("beds","baths","sq_feet","year_built","population","violent_crime",
+                             "manslaughter","rape","robbery","agg_assault","CrimeRate","mortgage_rate","mrate"),scale)
+
+#split standardized data
+trainIndex_std <- sample(seq_len(nrow(df_std)),size=.7*nrow(df_std)) 
+trainData_std <- df[trainIndex_std, ]
+testData_std <- df[-trainIndex_std, ]
+
+
+```
+
+Linear Model
+``` {r linearRegreesion}
+################################################################################################################
+#Linear Models:
+################################################################################################################
+
+# Split data into training and testing sets
+#trainIndex <- sample(seq_len(nrow(df)),size=.7*nrow(df)) 
+#trainData <- df[trainIndex, ]
+#testData <- df[-trainIndex, ]
+
+#Model 2 - house characteristics
+lm1<- lm(price~city+beds+baths+sq_feet+year_built,data=trainData)
+summary(lm1)
+pred_lm1 <- predict(lm1, newdata = testData) #predicted
+rmse_lm1 <- sqrt(sum((pred_lm1-testData$price)^2, na.rm=TRUE)/nrow(testData)) #rmse
+coef(lm1
+cat( "Linear Regression Model 1 beds+baths+sq_feet+year_built:\nRMSE: ", rmse_lm1,"\nR2: ",summary(lm1)$r.squared ,"\nAdjusted R2:",summary(lm1)$adj.r.squared)
+
+#Model 2 - FBI added
+lm2<- lm(price~beds+baths+sq_feet+year_built+CrimeRate,data=trainData)
+summary(lm2)
+pred_lm2 <- predict(lm2, newdata = testData) #predicted
+rmse_lm2 <- sqrt(sum((pred_lm1-testData$price)^2, na.rm=TRUE)/nrow(testData)) #rmse
+coef(lm2)
+cat( "Linear Regression Model 2 city+beds+baths+sq_feet+year_built+CrimeRate:\nRMSE: ", rmse_lm2,"\nR2: ",summary(lm2)$r.squared ,"\nAdjusted R2: ",summary(lm2)$adj.r.squared)
+
+
+
+#Model 3 - mortgage rate added
+lm3<- lm(price~city+beds+baths+sq_feet+year_built+CrimeRate+mortgage_rate,data=trainData)
+summary(lm3)
+pred_lm3 <- predict(lm3, newdata = testData) #predicted
+rmse_lm3 <- sqrt(sum((pred_lm3-testData$price)^2, na.rm=TRUE)/nrow(testData)) #rmse
+coef(lm3)
+cat( "Linear Regression Model 3 city+beds+baths+sq_feet+year_built+CrimeRate+mortgage_rate:\nRMSE: ", rmse_lm3,"\nR2: ",summary(lm3)$r.squared ,"\nAdjusted R2: ",summary(lm3)$adj.r.squared)
+
+
+
+```
+
+
+Random Forest Model
+``` {r randomForest}
+################################################################################################################
+#Random Forrest Regression
+################################################################################################################
+#Creating categories for the price, did not use at the end
+df1<-df
+df1$price_category <- ifelse(df1$price<250000,"Low",
+                             ifelse(df1$price<500000,"Medium",ifelse(df1$price<1000000,"Medium-High",
+                                          ifelse(df1$price<2000000,"High",ifelse(df1$price<3500000,"Lexury","Top")))))
+
+row.has.na <- apply(trainData_std, 1, function(x){any(is.na(x))}) #Remove  NAs
+predictors_no_NA <- trainData_std[!row.has.na, ] #Remove  NAs
+
+#standardized model
+forest1 <- randomForest(price~city+beds+baths+sq_feet+CrimeRate+mortgage_rate+mrate ,data=predictors_no_NA,ntree = 1000,importance = T)
+pred_forest1 <- predict(forest1, newdata= testData_std) #prediction
+rmse_forest1<- sqrt(sum((pred_forest1-testData_std$price)^2, na.rm=TRUE)/nrow(testData_std)) #RMSE formula
+rmse_forest1
+summary(forest1) #summary
+importance(forest1) #importance
+plot(pred_forest1,testData_std$price)
+rsiduals <- (pred_forest1-testData_std$price)
+plot(testData_std$price,rsiduals)
+summary(forest1)
+forest1$rsq
+
+forPlot <-data.frame(rbind(cbind(testData_std$price,testData_std$sq_feet,rep(1,length(testData_std$price))),cbind(pred_forest1,testData_std$sq_feet,rep(2,length(pred_forest1)))))
+dim(testData)
+colnames(forPlot) <- c("Price", "SquareFeet", "Type")
+ggplot(forPlot,aes(x=SquareFeet, y = Price,group=as.factor(Type),color=as.factor(Type)))+
+    geom_point()
+
+
+#non standardized works better than standized 
+row.has.na1 <- apply(trainData, 1, function(x){any(is.na(x))})
+trainData_na <- trainData[!row.has.na1, ]
+
+forest2 <- randomForest(price~city+beds+baths+sq_feet+CrimeRate+mortgage_rate ,data=trainData_na,ntree = 1000,importance = T)
+pred_forest2 <- predict(forest2, newdata= testData)
+rmse_forest2<- sqrt(sum((pred_forest2-testData$price)^2, na.rm=TRUE)/nrow(testData))
+rmse_forest2
+summary(forest2)
+importance(forest2)
+plot(pred_forest2,testData$price,main="Random Forest Predictions",
+        xlab="predicted price",
+        ylab="actual price")
+
+residualsF2 <- (pred_forest2-testData$price)
+plot(testData_std$price,residualsF2,main="Random Forest Model Residuals",
+        xlab="Actual Price",
+        ylab="Residuals")
+
+crossVal_RF <- caret::train(price~city+beds+baths+sq_feet+mortgage_rate+mrate, data = nm,
+               method = "randomForest",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+summary(crossVal_RF$resample)
+
+```
+
+
+
+Support Vector Model
+``` {r SVR}
+IQR = 1200000-575000
+df2 <- df %>% filter(price>(575000-1.5*IQR),price<(1200000+1.5*IQR))
+boxplot(df2$price)
+# Split data into training and testing sets #NEW DATASET PDF
+trainIndex <- sample(seq_len(nrow(df2)),size=.7*nrow(df2)) 
+trainData <- df2[trainIndex, ]
+testData <- df2[-trainIndex, ]
+ 
+#SVM Model 1
+#Regression with SVM
+modelsvm = svm(price~city+beds+baths+sq_feet+CrimeRate+mortgage_rate+mrate ,trainData,kernel = 'linear')
+
+#Predict using SVM regression
+predYsvm = predict(modelsvm, testData)
+testDatanm <- na.omit(testData)
+testDatanm$price
+length(predYsvm)
+length(testDatanm$price)
+#Overlay SVM Predictions on Scatter Plot
+plot(testDatanm$price, predYsvm,main="SVR Predictions",
+        xlab="predicted price",
+        ylab="actual price")
+
+residuals <- (predYsvm-testDatanm$price)
+plot(testDatanm$price,residuals,main="SVR Residuals",
+        xlab="Actual Price",
+        ylab="Residuals")
+
+rmseSVMR<- sqrt(sum((predYsvm-testDatanm$price)^2, na.rm=TRUE)/nrow(testDatanm))
+rmseSVMR
+
+
+#SVM Model 2
+modelsvm2 = svm(price~city+beds+baths+sq_feet+CrimeRate+mortgage_rate+mrate ,trainData,kernel = 'polynomial')
+
+#Predict using SVM regression
+predYsvm2 = predict(modelsvm2, testData)
+#length(na.omit(testData$price))
+testDatannm1 <- na.omit(testData)
+testDatannm1$price
+length(predYsvm2)
+length(testDatannm1$price)
+#Overlay SVM Predictions on Scatter Plot
+plot(testDatannm1$price, predYsvm2)
+
+residuals <- (predYsvm2-testDatannm1$price)
+plot(testDatannm1$price,residuals)
+
+rmseSVMR2<- sqrt(sum((predYsvm1-testDatanm_std$price)^2, na.rm=TRUE)/nrow(testDatanm_std))
+rmseSVMR2
+
+
+```
+
+Cross Validation
+
+``` {r CrossValidation, echo=False}
+#Cross Validation:
+
+nm <- na.omit(df) #remove Nas
+set.seed(123) # seed each train
+crossVal <- caret::train(price~city+beds+baths+sq_feet+mortgage_rate+mrate, data = nm,
+               method = "lm",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+data1 <- data.frame(cbind(crossVal$resample$Rsquared,crossVal$resample$RMSE,crossVal$resample$MAE)) #creating a dataframe of results
+colnames(data1) <- c("Rsquared","RMSE","MAE")
+data1$RsquaredAdj <- 1-((1-data1$Rsquared)*((dim(nm)[1])-1))/((dim(nm)[1])-1-6) # Adjusted R squared manually
+data1$Type <- "Linear Regression"
+summary(crossVal$resample)
+
+#getting importance
+var_imp<-caret::varImp(crossVal,scale = F)$importance
+var_imp <- data.frame(variables=row.names(var_imp), importance=var_imp$Overall)
+var_imp$type <- "Linear Regression"
+
+#PCR Model, not used in paper
+set.seed(123)
+crossVal_2 <- caret::train(price~city+beds+baths+CrimeRate+sq_feet+mortgage_rate+mrate, data = nm,
+               method = "pcr",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+summary(crossVal_2$resample)
+data2 <- data.frame(cbind(crossVal_2$resample$Rsquared,crossVal_2$resample$RMSE,crossVal_2$resample$MAE))
+colnames(data2) <- c("Rsquared","RMSE","MAE")
+data2$RsquaredAdj <- 1-((1-data2$Rsquared)*((dim(nm_std)[1])-1))/((dim(nm_std)[1])-1-7) # Adjusted R squared manually
+data2$Type <- "Principle Component Regression"
+
+print(crossVal_2)
+var_imp2<-caret::varImp(crossVal_2,scale = F)$importance
+var_imp2 <- data.frame(variables=row.names(var_imp2), importance=var_imp2$Overall)
+var_imp2$type <- "Principle Component Regression"
+
+
+#Model Regularized Regression
+set.seed(123)
+library(glmnet)
+crossVal_3 <- caret::train(price~city+beds+baths+CrimeRate+sq_feet+mortgage_rate+mrate, data = nm,
+               method = "glmnet",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+summary(crossVal_3$resample)
+data3 <- data.frame(cbind(crossVal_3$resample$Rsquared,crossVal_3$resample$RMSE,crossVal_3$resample$MAE))
+colnames(data3) <- c("Rsquared","RMSE","MAE")
+data3$RsquaredAdj <- 1-((1-data3$Rsquared)*((dim(nm_std)[1])-1))/((dim(nm_std)[1])-1-7)
+data3$Type <- "Regularized Regression"
+
+print(crossVal_3)
+var_imp3<-caret::varImp(crossVal_3,scale = F)$importance
+var_imp3 <- data.frame(variables=row.names(var_imp3), importance=var_imp3$Overall)
+var_imp3$type <- "Regularized Regression"
+
+
+#MARS
+set.seed(123)
+library(earth)
+crossVal_4 <- caret::train(price~city+beds+baths+CrimeRate+sq_feet+mortgage_rate+mrate, data = nm_o,
+               method = "earth",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+summary(crossVal_4$resample)
+data4 <- data.frame(cbind(crossVal_4$resample$Rsquared,crossVal_4$resample$RMSE,crossVal_4$resample$MAE))
+colnames(data4) <- c("Rsquared","RMSE","MAE")
+data4$RsquaredAdj <- 1-((1-data4$Rsquared)*((dim(nm_std)[1])-1))/((dim(nm_std)[1])-1-7)
+data4$Type <- "MARS"
+
+#importance
+print(crossVal_4)
+var_imp4<-caret::varImp(crossVal_4,scale = F)$importance
+var_imp4 <- data.frame(variables=row.names(var_imp4), importance=var_imp4$Overall)
+var_imp4$type <- "MARS"
+
+
+set.seed(123)
+#Removing outliers from the dataset
+summary(nm$price)
+IQR = 1200000-575000
+nm_o <- nm %>% filter(price>(575000-1.5*IQR),price<(1200000+1.5*IQR))
+library(LiblineaR)
+#SVR Model
+crossVal_5 <- caret::train(price~city+beds+baths+CrimeRate+sq_feet+mortgage_rate+mrate, data = nm_o,
+               method = "svmLinear3",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+
+summary(crossVal_5$resample)
+data5 <- data.frame(cbind(crossVal_5$resample$Rsquared,crossVal_5$resample$RMSE,crossVal_5$resample$MAE))
+colnames(data5) <- c("Rsquared","RMSE","MAE")
+data5$RsquaredAdj <- 1-((1-data5$Rsquared)*((dim(nm_std)[1])-1))/((dim(nm_std)[1])-1-7)
+data5$Type <- "Support Vector Regression"
+
+var_imp5<-caret::varImp(crossVal_5,scale = F)$importance
+var_imp5 <- data.frame(variables=row.names(var_imp5), importance=var_imp5$Overall)
+var_imp5$type <- "Support Vector Regression"
+
+set.seed(123)
+crossVal_6 <- caret::train(price~city+beds+baths+CrimeRate+sq_feet+mortgage_rate+mrate, data = nm,
+               method = "rf",
+               trControl = trainControl(method = "cv", number = 10))
+
+
+summary(crossVal_6$resample)
+data6 <- data.frame(cbind(crossVal_6$resample$Rsquared,crossVal_6$resample$RMSE,crossVal_6$resample$MAE))
+colnames(data6) <- c("Rsquared","RMSE","MAE")
+data6$RsquaredAdj <- 1-((1-data6$Rsquared)*((dim(nm_std)[1])-1))/((dim(nm_std)[1])-1-7)
+data6$Type <- "Random Forest"
+
+crossVal_6$finalModel
+crossVal_6
+
+#cross validation model for random forest
+var_imp6<-caret::varImp(crossVal_6,scale = F)$importance
+var_imp6 <- data.frame(variables=row.names(var_imp6), importance=var_imp6$Overall)
+var_imp6$type <- "Random Forest"
+forPlot <- rbind(var_imp,var_imp3,var_imp4,var_imp5,var_imp6)
+
+#final full dataset that has information of all Cross validated models
+dataAll <- rbind(data1,data3,data4,data5,data6)
+dataAll_sum <- ddply(dataAll, c("Type"),summarise,N= length(RMSE),mean = mean(RMSE),sd= sd(RMSE),se= sd / sqrt(N))
+dataAll_rad <- ddply(dataAll, c("Type"),summarise,N= length(RsquaredAdj),mean = mean(RsquaredAdj),sd= sd(RsquaredAdj),se= sd / sqrt(N))
+sumData <- cbind(dataAll_sum$Type,dataAll_sum$N,round(dataAll_sum$mean,0),round(dataAll_rad$mean,3))
+colnames(sumData) <-c("Model","# of CV samples","RMSE","Adjusted Rsquared")
+library(knitr)
+kable(sumData,align="c")
+
+
+#plot to see the adjusted R squared
+ggplot(dataAll_rad,aes(x=Type,y=mean))+
+    geom_errorbar(aes(ymin=mean-se,ymax=mean+se),color="blue",width=0.2)+labs(title ="Adjusted R squared of models", y="Adjusted R squared", x ="Model")+
+    theme_classic()
+
+
+#plot to see the RMSE of all models
+ggplot(dataAll_sum,aes(x=Type,y=mean))+
+    geom_errorbar(aes(ymin=mean-se,ymax=mean+se),color="blue",width=0.2)+labs(title ="RMSE of models", y="RMSE", x ="Model")+
+    theme_classic()
+
+#plot to see the importances of all the models
+ggplot(forPlot,aes(x=reorder(variables, importance), y=importance,group = type)) + 
+        geom_bar(stat='identity') + 
+        coord_flip() + 
+        facet_wrap(~type,scales="free")+
+        xlab('Variables') +
+        labs(title='Variable importance') + 
+        theme_minimal() + 
+        theme(axis.text = element_text(size = 10), 
+              axis.title = element_text(size = 15), 
+              plot.title = element_text(size = 20), )
+
+```
